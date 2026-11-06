@@ -1,0 +1,195 @@
+// Загружаем файл .env и кладём все переменные из него в process.env — чтобы дальше можно было писать process.env.PORT
+require('dotenv').config();
+// Подключаем Express и сохраняем в переменную
+const express = require('express');
+// Из библиотеки uuid достаём функцию v4 (генератор случайных UUID) 
+const { v4: uuidv4 } = require('uuid');
+// Подключаем Mongoose — драйвер для работы с MongoDB
+const mongoose = require('mongoose');
+
+// Создаём приложение Express
+const app = express();
+// Автоматически разбираем JSON из тела запроса и кладём его в req.body
+app.use(express.json());
+
+// Адрес базы: берём из .env
+const MONGO_URI = process.env.MONGO_URI;
+// Порт: берём из .env
+const PORT = process.env.PORT;
+// Логин и ФИО: берём из .env
+const MOODLE_LOGIN = process.env.MOODLE_LOGIN;
+const MOODLE_FULLNAME = process.env.MOODLE_FULLNAME;
+// Токен для проверки Authorization: Bearer ...: берём из .env
+const AUTH_TOKEN = process.env.AUTH_TOKEN;
+
+// Подключаемся к MongoDB: .then() выполняется при успехе, .catch() — при ошибке
+mongoose.connect(MONGO_URI)
+  .then(() => console.log('MongoDB connected'))
+  .catch(err => console.error('MongoDB connection error:', err));
+
+// Описываем, как выглядит задача в коллекции
+const TaskSchema = new mongoose.Schema({
+  id: { type: String, required: true, unique: true },
+  ownerLogin: { type: String, required: true },
+  title: { type: String, required: true, trim: true },
+  done: { type: Boolean, default: false },
+  runId: { type: String, required: true },
+  createdAt: { type: Date, required: true }
+});
+// Создаём модель — через неё будут идти все запросы: Task.find(), new Task(...), Task.deleteOne()
+const Task = mongoose.model('Task', TaskSchema);
+
+// Функция проверки RunId
+function validateRunId(runId) {
+// Отсекаем undefined/null и не-строки
+  if (!runId || typeof runId !== 'string') return false;
+// Применяем регулярное выражение из задания
+  return /^[A-Za-z0-9_-]{1,64}$/.test(runId);
+}
+
+// Функция проверки заголовка
+function validateTitle(title) {
+  if (!title || typeof title !== 'string') return false;
+// Убираем пробелы по краям через .trim() и проверяем: после trim от 1 до 200 символов
+  const trimmed = title.trim();
+  return trimmed.length >= 1 && trimmed.length <= 200;
+}
+
+// Функция проверки токена
+function authMiddleware(req, res, next) {
+// Берём заголовок Authorization, достаём токен
+  const token = req.headers.authorization?.split(' ')[1];
+// Токен неверный → ответ 401
+  if (token !== AUTH_TOKEN) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+// Правильный → next() пропускает запрос дальше к обработчику маршрута
+  next();
+}
+
+// Маршруты
+
+// GET /login/ — без токена, plain text
+app.get('/login/', (req, res) => {
+  res.type('text/plain').send(MOODLE_LOGIN);
+});
+
+// GET /api/author/ — JSON с логином и ФИО
+app.get('/api/author/', authMiddleware, (req, res) => {
+  res.json({ login: MOODLE_LOGIN, fullName: MOODLE_FULLNAME });
+});
+
+// POST /api/tasks/ — создать задачу
+app.post('/api/tasks/', authMiddleware, async (req, res) => {
+  try {
+// Достаём из тела запроса только title и runId
+    const { title, runId } = req.body;
+// Валидация
+    if (!validateTitle(title)) {
+      return res.status(400).json({ error: 'Invalid title' });
+    }
+    if (!validateRunId(runId)) {
+      return res.status(400).json({ error: 'Invalid runId' });
+    }
+// Создаём документ, сохраняем в БД (await — ждём запись), отвечаем кодом 201 и самим делом
+    const newTask = new Task({
+      id: uuidv4(),
+      ownerLogin: MOODLE_LOGIN,
+      title: title.trim(),
+      done: false,
+      runId,
+      createdAt: new Date() // будет в UTC
+    });
+
+    await newTask.save();
+    res.status(201).json(newTask.toObject());
+// Любая ошибка БД → 503
+  } catch (err) {
+    console.error(err);
+    res.status(503).json({ error: 'Database error' });
+  }
+});
+
+// GET /api/tasks/?runId=... — список по runId
+app.get('/api/tasks/', authMiddleware, async (req, res) => {
+  try {
+    const { runId } = req.query;
+    if (!runId) {
+      return res.status(400).json({ error: 'Missing runId query param' });
+    }
+    if (!validateRunId(runId)) {
+      return res.status(400).json({ error: 'Invalid runId' });
+    }
+// Ищем задачи автора с данным runId. .lean() превращает результаты в обычные объекты. Если ничего не найдено, find вернёт []
+    const tasks = await Task.find({ ownerLogin: MOODLE_LOGIN, runId }).lean();
+    // Приводим createdAt к ISO 8601 строке
+    const formatted = tasks.map(t => ({
+      ...t,
+      createdAt: t.createdAt.toISOString()
+    }));
+    res.json(formatted);
+  } catch (err) {
+    console.error(err);
+    res.status(503).json({ error: 'Database error' });
+  }
+});
+
+// GET /api/tasks/:id/ — одна задача
+app.get('/api/tasks/:id/', authMiddleware, async (req, res) => {
+  try {
+// Ищем одну задачу по UUID из пути (req.params.id)
+    const task = await Task.findOne({ id: req.params.id, ownerLogin: MOODLE_LOGIN }).lean();
+    if (!task) return res.status(404).json({ error: 'Not found' });
+    task.createdAt = task.createdAt.toISOString();
+    res.json(task);
+  } catch (err) {
+    console.error(err);
+    res.status(503).json({ error: 'Database error' });
+  }
+});
+
+// PATCH /api/tasks/:id/ — обновить title и/или done
+app.patch('/api/tasks/:id/', authMiddleware, async (req, res) => {
+  try {
+    const { title, done } = req.body;
+    const updates = {};
+
+    if (title !== undefined) {
+      if (!validateTitle(title)) return res.status(400).json({ error: 'Invalid title' });
+      updates.title = title.trim();
+    }
+    if (done !== undefined) {
+      if (typeof done !== 'boolean') return res.status(400).json({ error: 'Invalid done value' });
+      updates.done = done;
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No valid fields to update' });
+    }
+
+    const task = await Task.findOneAndUpdate(
+      { id: req.params.id, ownerLogin: MOODLE_LOGIN },
+      updates,
+      { new: true, lean: true }
+    );
+
+    if (!task) return res.status(404).json({ error: 'Not found' });
+    task.createdAt = task.createdAt.toISOString();
+    res.json(task);
+  } catch (err) {
+    console.error(err);
+    res.status(503).json({ error: 'Database error' });
+  }
+});
+
+// DELETE /api/tasks/:id/ — удалить
+app.delete('/api/tasks/:id/', authMiddleware, async (req, res) => {
+  try {
+    const result = await Task.deleteOne({ id: req.params.id, ownerLogin: MOODLE_LOGIN });
+    if (result.deletedCount === 0) return res.status(404).json({ error: 'Not found' });
+    res.status(204).send();
+  } catch (err) {
+    console.error(err);
+    res.status(503).json({ error: 'Database error' });
+  }
+});
